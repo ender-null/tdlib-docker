@@ -34,7 +34,7 @@ jobs:
       - name: Check if commit ID is different
         id: check
         run: |
-          if [[ "$(<tdlib_commit_id)" != "$(<TDLib.txt)" ]]; then
+          if [[ "$(<tdlib_commit_id)" != "$(<tdlib_last_commit_builded)" ]]; then
             echo "::set-output name=update::1"
             echo "::set-output name=commit_id::$(<tdlib_commit_id)"
           else
@@ -49,14 +49,14 @@ jobs:
     steps:
       - uses: actions/checkout@v2
 
-      - name: Update TDLib commit ID
-        run: echo "${{ needs.check.outputs.commit_id }}" > TDLib.txt
+      - name: Update tdlib_last_commit_builded
+        run: echo "${{ needs.check.outputs.commit_id }}" > tdlib_last_commit_builded
       - name: Create commit
         env:
           GITHUB_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
         run: |
-          git add TDLib.txt
-          git -c user.name="GitHub Actions" -c user.email="actions@github.com" commit --allow-empty -m "Update TDLib" --author="${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>"
+          git add tdlib_last_commit_builded
+          git -c user.name="GitHub Actions" -c user.email="actions@github.com" commit --allow-empty -m "Update tdlib_last_commit_builded" --author="${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>"
           git push
 
   push-alpine:
