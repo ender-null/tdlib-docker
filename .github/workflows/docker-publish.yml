@@ -1,157 +1,122 @@
 name: Docker
 
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
 on:
+  schedule:
+    - cron: "43 2 * * *"
   push:
     branches:
       - main
-
-    tags:
-      - v*
-
-  schedule:
-    - cron: "0 4 * * *"
+    # Publish semver tags as releases.
+    tags: ["v*.*.*"]
+  pull_request:
+    branches:
+      - main
 
 env:
-  IMAGE_NAME: tdlib-docker
+  # Use docker.io for Docker Hub if empty
+  REGISTRY: ghcr.io
+  # github.repository as <account>/<repo>
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  check:
-    outputs:
-      update: ${{ steps.check.outputs.update }}
-      commit_id: ${{ steps.check.outputs.commit_id }}
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # This is used to complete the identity challenge
+      # with sigstore/fulcio when running outside of PRs.
+      id-token: write
 
     steps:
-      - uses: actions/checkout@v2
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-      - name: Get TDLib last commit id
-        run: |
-          wget --header="Accept: application/vnd.github.VERSION.sha" -qO tdlib_commit_id  $GITHUB_API_URL/repos/tdlib/td/commits/master
+      # Install the cosign tool except on PR
+      # https://github.com/sigstore/cosign-installer
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v3.0.5
+        with:
+          cosign-release: "v1.13.1"
 
-      - name: Get short commit id
-        run: git rev-parse --short "$(<tdlib_commit_id)" > tdlib_commit_id
+      # Workaround: https://github.com/docker/build-push-action/issues/461
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@79abd3f86f79a9d68a23c75a09a9a85889262adf
 
-      - name: Check if commit ID is different
-        id: check
-        run: |
-          if [[ "$(<tdlib_commit_id)" != "$(<tdlib_last_commit_builded)" ]]; then
-            echo "::set-output name=update::1"
-            echo "::set-output name=commit_id::$(<tdlib_commit_id)"
-          else
-            echo "::set-output name=update::0"
-          fi
-
-  update:
-    runs-on: ubuntu-latest
-    needs: check
-    if: needs.check.outputs.update == 1
-
-    steps:
-      - uses: actions/checkout@v2
-
-      - name: Update tdlib_last_commit_builded
-        run: echo "${{ needs.check.outputs.commit_id }}" > tdlib_last_commit_builded
-      - name: Create commit
+      - name: Load secret
+        id: op-load-secret
+        uses: 1password/load-secrets-action@v1.2.0
+        with:
+          export-env: true
         env:
-          GITHUB_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
-        run: |
-          git add tdlib_last_commit_builded
-          git -c user.name="GitHub Actions" -c user.email="actions@github.com" commit --allow-empty -m "Update tdlib_last_commit_builded" --author="${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>"
-          git push
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          GITHUB_TOKEN: op://end.works/GitHub Token/credential
 
-  push-alpine:
-    runs-on: ubuntu-latest
-    needs: update
+      # Login against a Docker registry except on PR
+      # https://github.com/docker/login-action
+      - name: Log into registry ${{ env.REGISTRY }}
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v2.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ env.GITHUB_TOKEN }}
 
-    steps:
-      - uses: actions/checkout@v2
+      # Extract metadata (tags, labels) for Docker
+      # https://github.com/docker/metadata-action
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v4.4.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=schedule
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build image
-        run: docker build . --file Dockerfile.alpine --tag $IMAGE_NAME
+      # Build and push Docker image with Buildx (don't push on PR)
+      # https://github.com/docker/build-push-action
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@v4.0.0
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Log into GitHub Container Registry
-        run: echo "${{ secrets.CR_PAT }}" | docker login https://ghcr.io -u ${{ github.actor }} --password-stdin
-
-      - name: Push image to GitHub Container Registry
-        run: |
-          IMAGE_ID=ghcr.io/${{ github.repository_owner }}/$IMAGE_NAME
-
-          # Change all uppercase to lowercase
-          IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
-
-          # Strip git ref prefix from version
-          VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
-
-          # Strip "v" prefix from tag name
-          [[ "${{ github.ref }}" == "refs/tags/"* ]] && VERSION=$(echo $VERSION | sed -e 's/^v//')
-
-          # Use Docker `latest` tag convention
-          [ "$VERSION" == "main" ] && VERSION=latest
-
-          echo IMAGE_ID=$IMAGE_ID
-          echo VERSION=$VERSION
-
-          docker tag $IMAGE_NAME $IMAGE_ID:$VERSION
-          docker push $IMAGE_ID:$VERSION
-          docker tag $IMAGE_NAME $IMAGE_ID:alpine
-          docker push $IMAGE_ID:alpine
-          docker create --name $IMAGE_NAME $IMAGE_ID:$VERSION
+      # Sign the resulting Docker image digest except on PRs.
+      # This will only write to the public Rekor transparency log when the Docker
+      # repository is public to avoid leaking data.  If you would like to publish
+      # transparency data even for private images, pass --force to cosign below.
+      # https://github.com/sigstore/cosign
+      - name: Sign the published Docker image
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        # This step uses the identity token to provision an ephemeral certificate
+        # against the sigstore community Fulcio instance.
+        run: echo "${{ steps.meta.outputs.tags }}" | xargs -I {} cosign sign {}@${{ steps.build-and-push.outputs.digest }}
 
       - name: Get TDLib binary from image
         run: |
-          docker cp --follow-link $IMAGE_NAME:/usr/local/lib/libtdjson.so .
+          docker create --name tdlib ${{ github.repository }}
+          docker cp --follow-link ${{ github.repository }}:/usr/local/lib/libtdjson.so .
 
       - name: Generate artifact for TDLib binary
         uses: actions/upload-artifact@v2
         with:
-          name: libtdjson-alpine.so
-          path: libtdjson.so
-
-  push-debian:
-    runs-on: ubuntu-latest
-    needs: update
-
-    steps:
-      - uses: actions/checkout@v2
-
-      - name: Build image
-        run: docker build . --file Dockerfile.debian --tag $IMAGE_NAME
-
-      - name: Log into GitHub Container Registry
-        run: echo "${{ secrets.CR_PAT }}" | docker login https://ghcr.io -u ${{ github.actor }} --password-stdin
-
-      - name: Push image to GitHub Container Registry
-        run: |
-          IMAGE_ID=ghcr.io/${{ github.repository_owner }}/$IMAGE_NAME
-
-          # Change all uppercase to lowercase
-          IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
-
-          # Strip git ref prefix from version
-          VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
-
-          # Strip "v" prefix from tag name
-          [[ "${{ github.ref }}" == "refs/tags/"* ]] && VERSION=$(echo $VERSION | sed -e 's/^v//')
-
-          # Use Docker `latest` tag convention
-          [ "$VERSION" == "main" ] && VERSION=latest
-
-          echo IMAGE_ID=$IMAGE_ID
-          echo VERSION=$VERSION
-          VERSION+="-debian"
-
-          docker tag $IMAGE_NAME $IMAGE_ID:$VERSION
-          docker push $IMAGE_ID:$VERSION
-          docker tag $IMAGE_NAME $IMAGE_ID:debian
-          docker push $IMAGE_ID:debian
-          docker create --name $IMAGE_NAME $IMAGE_ID:$VERSION
-
-      - name: Get TDLib binary from image
-        run: |
-          docker cp --follow-link $IMAGE_NAME:/usr/local/lib/libtdjson.so .
-
-      - name: Generate artifact for TDLib binary
-        uses: actions/upload-artifact@v2
-        with:
-          name: libtdjson-debian.so
           path: libtdjson.so
