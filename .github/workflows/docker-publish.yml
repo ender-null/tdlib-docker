@@ -113,8 +113,8 @@ jobs:
 
       - name: Get TDLib binary from image
         run: |
-          docker create --name tdlib ${{ github.repository }}
-          docker cp --follow-link ${{ github.repository }}:/usr/local/lib/libtdjson.so .
+          docker create --name tdlib ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker cp --follow-link tdlib:/usr/local/lib/libtdjson.so .
 
       - name: Generate artifact for TDLib binary
         uses: actions/upload-artifact@v2
