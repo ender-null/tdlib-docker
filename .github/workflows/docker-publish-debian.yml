@@ -1,4 +1,4 @@
-name: Docker
+name: Docker (debian)
 
 # This workflow uses actions that are not certified by GitHub.
 # They are provided by a third-party and are governed by
@@ -76,8 +76,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: |
-            latest=true
-            suffix=-alpine
+            latest=false
+            suffix=-debian
           tags: |
             type=schedule
             type=ref,event=branch
